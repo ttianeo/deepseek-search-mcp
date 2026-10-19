@@ -338,6 +338,37 @@ RestartSec=2
 WantedBy=multi-user.target
 ```
 
+## 发布
+
+[`.github/workflows/release.yml`](.github/workflows/release.yml) 在以下情况自动运行：
+
+- 推送 `v*` 标签，例如 `v0.1.0`；
+- 在 GitHub 上发布 Release（`release: published`）。
+
+工作流会先运行 `go test -race ./...` 和 `go vet ./...`，然后构建 `linux/amd64` 镜像，导出为 tar 并上传到对应 Release：
+
+```text
+deepseek-search-mcp-v0.1.0-linux-amd64.tar
+deepseek-search-mcp-v0.1.0-linux-amd64.tar.sha256
+```
+
+触发方式：
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+如果对应 Release 不存在，工作流会自动创建；如果已存在，则用 `--clobber` 更新同名资产，因此对同一个标签重复运行是安全的。带 `-` 的标签（如 `v0.1.0-rc1`）在新建 Release 时会标记为 pre-release。
+
+下载并加载镜像：
+
+```bash
+sha256sum -c deepseek-search-mcp-v0.1.0-linux-amd64.tar.sha256
+docker load -i deepseek-search-mcp-v0.1.0-linux-amd64.tar
+docker run --rm -p 127.0.0.1:8080:8080 deepseek-search-mcp:v0.1.0
+```
+
 ## 错误与限流
 
 DeepSeek 错误会作为 MCP 工具错误（`isError: true`）返回，并带有状态码与处理提示：

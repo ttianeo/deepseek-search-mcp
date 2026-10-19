@@ -1,0 +1,132 @@
+name: Release
+
+run-name: Release ${{ github.event.release.tag_name || github.ref_name }}
+
+"on":
+  push:
+    tags:
+      - "v*"
+  release:
+    types: [published]
+
+# The test job only needs read access; the release job gets write access to
+# create/update the GitHub Release and upload assets.
+permissions:
+  contents: read
+
+# A tag push may create the release, which fires the "release" event once more.
+# Serialize runs for the same tag; the upload step is idempotent (--clobber).
+concurrency:
+  group: release-${{ github.event.release.tag_name || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  DOCKER_BUILDKIT: "1"
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || github.ref }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run tests
+        run: go test -race ./...
+
+      - name: Run vet
+        run: go vet ./...
+
+  release:
+    name: Build image and publish release asset
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || github.ref }}
+
+      - name: Resolve release tag
+        id: meta
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ -n "${RELEASE_TAG:-}" ]; then
+            TAG="$RELEASE_TAG"
+          else
+            TAG="$REF_NAME"
+          fi
+          # Docker image tags and release asset names cannot contain "/".
+          # Replace any other character Docker does not allow in a tag as well.
+          SAFE_TAG="$(printf '%s' "$TAG" | sed 's/[^A-Za-z0-9_.-]/-/g')"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "safe_tag=$SAFE_TAG" >> "$GITHUB_OUTPUT"
+          echo "Resolved tag: $TAG (image/asset tag: $SAFE_TAG)"
+
+      - name: Build Docker image
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+          SAFE_TAG: ${{ steps.meta.outputs.safe_tag }}
+        run: |
+          set -euo pipefail
+          docker build \
+            --platform linux/amd64 \
+            --build-arg VERSION="$TAG" \
+            --build-arg GOPROXY=https://proxy.golang.org,direct \
+            -t "deepseek-search-mcp:${SAFE_TAG}" \
+            .
+
+      - name: Export image as tar
+        id: export
+        env:
+          SAFE_TAG: ${{ steps.meta.outputs.safe_tag }}
+        run: |
+          set -euo pipefail
+          ASSET="deepseek-search-mcp-${SAFE_TAG}-linux-amd64.tar"
+          docker save "deepseek-search-mcp:${SAFE_TAG}" -o "$ASSET"
+          sha256sum "$ASSET" > "${ASSET}.sha256"
+          echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
+          ls -lh "$ASSET" "${ASSET}.sha256"
+
+      - name: Publish assets to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          ASSET: ${{ steps.export.outputs.asset }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; uploading assets with --clobber."
+            gh release upload "$TAG" "$ASSET" "${ASSET}.sha256" \
+              --repo "$REPO" \
+              --clobber
+          else
+            echo "Release $TAG does not exist; creating it."
+            args=(
+              release create "$TAG" "$ASSET" "${ASSET}.sha256"
+              --repo "$REPO"
+              --title "$TAG"
+              --generate-notes
+            )
+            # Tags such as v0.1.0-rc1 are published as pre-releases.
+            if [[ "$TAG" == *-* ]]; then
+              args+=(--prerelease)
+            fi
+            gh "${args[@]}"
+          fi
